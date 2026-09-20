@@ -538,6 +538,87 @@ describe("MatchMaker", () => {
         assert.strictEqual(true, roomsAfterExpiration2[0].locked);
       });
 
+      describe("seat reservation rollback", () => {
+        it("reserveMultipleSeatsFor() should reserve seats for all clients", async () => {
+          const room = await matchMaker.createRoom("room3", {});
+          const sessionIds = [generateId(), generateId(), generateId()];
+
+          await matchMaker.reserveMultipleSeatsFor(
+            room,
+            sessionIds.map((sessionId) => ({ sessionId, options: {}, auth: undefined })),
+          );
+
+          const localRoom = matchMaker.getLocalRoomById(room.roomId);
+          for (const sessionId of sessionIds) {
+            assert.strictEqual(true, localRoom.hasReservedSeat(sessionId), `seat reserved for ${sessionId}`);
+          }
+
+          const cached = await matchMaker.getRoomById(room.roomId);
+          assert.strictEqual(3, cached.clients);
+        });
+
+        it("reserveMultipleSeatsFor() should be atomic: partial failures release the seats that succeeded", async () => {
+          const room = await matchMaker.createRoom("room2", {});
+          const sessionIds = [generateId(), generateId(), generateId()];
+
+          // room2 only fits 2 clients - the group of 3 can't be seated.
+          await assert.rejects(
+            matchMaker.reserveMultipleSeatsFor(
+              room,
+              sessionIds.map((sessionId) => ({ sessionId, options: {}, auth: undefined })),
+            ),
+            /already full/,
+          );
+
+          const localRoom = matchMaker.getLocalRoomById(room.roomId);
+          for (const sessionId of sessionIds) {
+            assert.strictEqual(false, localRoom.hasReservedSeat(sessionId), `no seat leaked for ${sessionId}`);
+          }
+
+          // client count is rolled back as well
+          const cached = await matchMaker.getRoomById(room.roomId);
+          assert.strictEqual(0, cached.clients);
+        });
+
+        it("releaseMultipleSeatsFor() should release fresh seat reservations", async () => {
+          const room = await matchMaker.createRoom("room3", {});
+          const sessionIds = [generateId(), generateId()];
+
+          await matchMaker.reserveMultipleSeatsFor(
+            room,
+            sessionIds.map((sessionId) => ({ sessionId, options: {}, auth: undefined })),
+          );
+
+          const localRoom = matchMaker.getLocalRoomById(room.roomId);
+          assert.strictEqual(true, localRoom.hasReservedSeat(sessionIds[0]));
+
+          const released = await matchMaker.releaseMultipleSeatsFor(room, sessionIds);
+          assert.deepStrictEqual(released, [true, true]);
+
+          for (const sessionId of sessionIds) {
+            assert.strictEqual(false, localRoom.hasReservedSeat(sessionId), `seat released for ${sessionId}`);
+          }
+
+          const cached = await matchMaker.getRoomById(room.roomId);
+          assert.strictEqual(0, cached.clients, "client count should be rolled back");
+        });
+
+        it("releaseMultipleSeatsFor() should not release consumed seats", async () => {
+          const reservedSeat = await matchMaker.joinOrCreate("room3");
+          const room = matchMaker.getLocalRoomById(reservedSeat.roomId);
+
+          // consume the seat by joining the room
+          await createDummyClient(reservedSeat).confirmJoinRoom(room);
+
+          const released = await matchMaker.releaseMultipleSeatsFor(
+            { roomId: room.roomId, processId: matchMaker.processId } as IRoomCache,
+            [reservedSeat.sessionId],
+          );
+          assert.deepStrictEqual(released, [false], "consumed seats are left untouched");
+          assert.strictEqual(1, room.clients.length);
+        });
+      });
+
       describe("locking rooms", () => {
         it("should automatically lock rooms", async () => {
           const _firstRoom = await matchMaker.joinOrCreate("room3");

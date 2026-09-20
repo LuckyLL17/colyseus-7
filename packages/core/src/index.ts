@@ -89,7 +89,7 @@ export {
 // Default rooms
 export { LobbyRoom } from './rooms/LobbyRoom.ts';
 export { RelayRoom } from './rooms/RelayRoom.ts';
-export { QueueRoom, type QueueOptions, type QueueMatchGroup, type QueueMatchTeam, type QueueClientData } from './rooms/QueueRoom.ts';
+export { QueueRoom, QueueReason, type QueueOptions, type QueueMatchGroup, type QueueMatchTeam, type QueueClientData, type QueueScoreFactors, type QueueScoreBreakdown, type QueueClientStatus, type QueueRoomStats } from './rooms/QueueRoom.ts';
 
 // Router / Endpoints
 export {

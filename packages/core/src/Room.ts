@@ -2168,6 +2168,45 @@ export class Room<T extends RoomOptions = RoomOptions> {
     return await Promise.all(promises);
   }
 
+  /**
+   * Release a fresh (not yet consumed) seat reservation, rolling back the
+   * client count it accounted for. Seats held by `allowReconnection()` and
+   * already consumed seats are left untouched.
+   *
+   * Used by the matchmaker to roll back failed/partial group reservations.
+   */
+  private async _releaseSeat(sessionId: string): Promise<boolean> {
+    const reservedSeat = this._reservedSeats[sessionId];
+    if (!reservedSeat) { return false; }
+
+    const [, , isConsumed, isWaitingReconnection] = reservedSeat;
+
+    // only fresh seat reservations can be rolled back
+    if (isConsumed || isWaitingReconnection) { return false; }
+
+    delete this._reservedSeats[sessionId];
+
+    if (this._reservedSeatTimeouts[sessionId]) {
+      clearTimeout(this._reservedSeatTimeouts[sessionId]);
+      delete this._reservedSeatTimeouts[sessionId];
+    }
+
+    // fresh reservations incremented the client count on reserve - roll it back
+    await this.#_decrementClientCount();
+
+    return true;
+  }
+
+  private async _releaseMultipleSeats(sessionIds: string[]): Promise<boolean[]> {
+    const results: boolean[] = [];
+
+    for (let i = 0; i < sessionIds.length; i++) {
+      results.push(await this._releaseSeat(sessionIds[i]));
+    }
+
+    return results;
+  }
+
   #_disposeIfEmpty() {
     const willDispose = (
       this.#_onLeaveConcurrent === 0 && // no "onLeave" calls in progress

@@ -25,6 +25,7 @@ import { getLockId, initializeRoomCache, type ExtractRoomCacheMetadata } from '.
 
 import { type ISeatReservation, CloseCode, ErrorCode } from '@colyseus/shared-types';
 import { getDefaultDriver, getDefaultPresence, getDefaultPublicAddress } from './utils/Env.ts';
+import type { QueueRoomStats } from './rooms/QueueRoom.ts';
 export type { ISeatReservation, ExtractRoomCacheMetadata };
 
 export { controller, stats, type MatchMakerDriver };
@@ -328,6 +329,31 @@ export async function query<T extends Room = any>(
   sortOptions?: SortOptions,
 ) {
   return await driver.query<T>(conditions, sortOptions);
+}
+
+/**
+ * Query live queue statistics of every `QueueRoom` instance registered
+ * under `roomName`. Each entry reports how many clients are waiting, why
+ * they are waiting (per-client reasons are available on each client through
+ * the "queue" message), and the estimated wait time.
+ *
+ * @param roomName - The name the queue rooms were defined with.
+ *
+ * @returns Promise<QueueRoomStats[]> - One entry per queue room (across all processes).
+ */
+export async function getQueueStats(roomName: string) {
+  const rooms = await query({ name: roomName });
+
+  const queueStats: Array<{ roomId: string, processId: string } & QueueRoomStats> = [];
+
+  for (const room of rooms) {
+    const queue = room.metadata?.['queue'] as QueueRoomStats | undefined;
+    if (queue) {
+      queueStats.push({ roomId: room.roomId, processId: room.processId, ...queue });
+    }
+  }
+
+  return queueStats;
 }
 
 /**
@@ -912,6 +938,11 @@ export async function reserveSeatFor(room: IRoomCache, options: ClientOptions, a
 
 /**
  * Reserve multiple seats for clients in a room
+ *
+ * The reservation is atomic: if any of the seats can't be reserved, the
+ * seats that did succeed are released again and a `SeatReservationError` is
+ * thrown - so a failed group reservation never leaks partially-reserved
+ * seats.
  */
 export async function reserveMultipleSeatsFor(room: IRoomCache, clientsData: Array<{ sessionId: string, options: ClientOptions, auth: any }>) {
   let sessionIds: string[] = [];
@@ -961,7 +992,77 @@ export async function reserveMultipleSeatsFor(room: IRoomCache, clientsData: Arr
     }
   }
 
+  //
+  // roll back partially-successful reservations: release the seats that did
+  // succeed, so no seats are left reserved for a group that can't be seated.
+  //
+  if (successfulSeatReservations.some((success) => !success)) {
+    const reservedSessionIds = sessionIds.filter((_, i) => successfulSeatReservations[i]);
+
+    if (reservedSessionIds.length > 0) {
+      try {
+        await releaseMultipleSeatsFor(room, reservedSessionIds);
+      } catch (e: any) {
+        // the room-side seat reservation timeout is the backstop here.
+        debugMatchMaking('failed to release partially-reserved seats on room \'%s\': %s', room.roomId, e.message);
+      }
+    }
+
+    throw new SeatReservationError(`${room.roomId} is already full.`);
+  }
+
   return successfulSeatReservations;
+}
+
+/**
+ * Release fresh (not yet consumed) seat reservations from a room.
+ *
+ * Used to roll back group reservations when a match falls through - e.g.
+ * room creation failed, or some clients of a ready group never confirmed.
+ * Seats held by `allowReconnection()` and already consumed seats are left
+ * untouched.
+ *
+ * @param room - The room to release seats from.
+ * @param sessionIds - The session ids whose seats should be released.
+ *
+ * @returns Promise<boolean[]> - Which seats were actually released.
+ */
+export async function releaseMultipleSeatsFor(room: IRoomCache, sessionIds: string[]) {
+  debugMatchMaking(
+    'releasing multiple seats. sessionIds: \'%s\', roomId: \'%s\', processId: \'%s\'',
+    sessionIds.join(', '), room.roomId, processId,
+  );
+
+  try {
+    return await remoteRoomCall<Room>(
+      room.roomId,
+      '_releaseMultipleSeats' as keyof Room,
+      [sessionIds],
+      REMOTE_ROOM_SHORT_TIMEOUT,
+    );
+
+  } catch (e: any) {
+    debugMatchMaking(e);
+
+    //
+    // the room cache from an unavailable process might've been used here.
+    // (this is a broken state when a process wasn't gracefully shut down)
+    // perform a health-check on the process before proceeding.
+    //
+    if (e.message === "ipc_timeout") {
+      if (
+        enableHealthChecks &&
+        !await healthCheckProcessId(room.processId)
+      ) {
+        // the process is gone - its reserved seats are gone with it.
+        return [];
+      }
+
+      throw new SeatReservationError(`timed out releasing seats on ${room.roomId}.`);
+    }
+
+    throw e;
+  }
 }
 
 /**
