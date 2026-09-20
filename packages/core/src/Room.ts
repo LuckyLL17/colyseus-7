@@ -2159,6 +2159,20 @@ export class Room<T extends RoomOptions = RoomOptions> {
     multipleAuthData: any = undefined,
     seconds: number = this.seatReservationTimeout,
   ) {
+    //
+    // Atomic capacity check: never leave the room with a partial set of
+    // reserved seats. Callers that need the whole batch (QueueRoom group
+    // dispatch) rely on an all-or-nothing result to decide whether the
+    // candidates can be skipped and re-queued instead.
+    //
+    if (
+      multipleSessionIds.length === 0 ||
+      (this.clients.length + Object.keys(this._reservedSeats).length + multipleSessionIds.length) > this.#_maxClients ||
+      this._internalState === RoomInternalState.DISPOSING
+    ) {
+      return multipleSessionIds.map(() => false);
+    }
+
     let promises: Promise<boolean>[] = [];
 
     for (let i = 0; i < multipleSessionIds.length; i++) {
@@ -2166,6 +2180,78 @@ export class Room<T extends RoomOptions = RoomOptions> {
     }
 
     return await Promise.all(promises);
+  }
+
+  /**
+   * Release a previously reserved (but not yet consumed) seat immediately.
+   *
+   * Used by rollback paths (e.g. QueueRoom group regrouping/timeout/failed
+   * dispatch) so seats don't have to wait for `seatReservationTimeout` to
+   * expire. Reconnection seats are intentionally left untouched.
+   *
+   * @returns true when a fresh reservation was released, false otherwise.
+   * @internal
+   */
+  private async _releaseSeat(sessionId: string) {
+    const reservedSeat = this._reservedSeats[sessionId];
+
+    if (reservedSeat === undefined) {
+      return false;
+    }
+
+    // already consumed (client is connecting/connected) — do not kick
+    if (reservedSeat[2] === true) {
+      return false;
+    }
+
+    // held by allowReconnection() — never release it from here
+    if (reservedSeat[3] === true) {
+      return false;
+    }
+
+    clearTimeout(this._reservedSeatTimeouts[sessionId]);
+    delete this._reservedSeatTimeouts[sessionId];
+    delete this._reservedSeats[sessionId];
+
+    await this.#_decrementClientCount();
+    return true;
+  }
+
+  /**
+   * Batch counterpart of {@link _releaseSeat}. Returns one boolean per
+   * sessionId so rollback callers can tell which seats were actually
+   * released vs. already consumed.
+   * @internal
+   */
+  private async _releaseSeats(sessionIds: string[]) {
+    const results: boolean[] = [];
+    for (let i = 0; i < sessionIds.length; i++) {
+      results.push(await this._releaseSeat(sessionIds[i]));
+    }
+    return results;
+  }
+
+  /**
+   * Dispose the room immediately when no clients/reservations remain.
+   * Exposed (via matchmaker IPC) for rollback paths that release the
+   * last seats of a freshly-created, otherwise-unused room — skipping
+   * the auto-dispose timeout.
+   * @internal
+   */
+  private _disposeIfEmptyNow() {
+    // The pending auto-dispose timer (armed when the seats were
+    // reserved) would otherwise keep an empty room alive up to
+    // seatReservationTimeout. Rollback paths want immediate reclamation.
+    if (
+      this.clients.length === 0 &&
+      Object.keys(this._reservedSeats).length === 0 &&
+      this._internalState !== RoomInternalState.DISPOSING
+    ) {
+      clearTimeout(this._autoDisposeTimeout);
+      this._autoDisposeTimeout = undefined;
+    }
+
+    return this.#_disposeIfEmpty();
   }
 
   #_disposeIfEmpty() {

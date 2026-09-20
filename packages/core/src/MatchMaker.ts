@@ -965,6 +965,99 @@ export async function reserveMultipleSeatsFor(room: IRoomCache, clientsData: Arr
 }
 
 /**
+ * Release previously reserved seats (rollback counterpart of
+ * {@link reserveMultipleSeatsFor}).
+ *
+ * Only seats that were reserved — and not yet consumed by a client joining
+ * the room — are released. Already-consumed seats are reported as `false`
+ * so callers can account for clients that made it into the room.
+ *
+ * Used by QueueRoom when a group is reassigned, its reservation window
+ * times out, or room creation fails mid-dispatch.
+ */
+export async function releaseSeatsFor(room: IRoomCache, sessionIds: string[]): Promise<boolean[]> {
+  if (sessionIds.length === 0) {
+    return [];
+  }
+
+  debugMatchMaking(
+    'releasing reserved seats. sessionIds: \'%s\', roomId: \'%s\'',
+    sessionIds.join(', '), room.roomId,
+  );
+
+  try {
+    return await remoteRoomCall<Room>(
+      room.roomId,
+      '_releaseSeats' as keyof Room,
+      [sessionIds],
+      REMOTE_ROOM_SHORT_TIMEOUT,
+    );
+
+  } catch (e: any) {
+    debugMatchMaking(e);
+
+    // The room's process may have died — reservations are gone with it.
+    // Do a health check so the cluster state is cleaned up, and report
+    // every seat as not-released-by-us (the stale timeout/server death
+    // already freed them).
+    if (
+      e.message === "ipc_timeout" &&
+      !(
+        enableHealthChecks &&
+        await healthCheckProcessId(room.processId)
+      )
+    ) {
+      throw new SeatReservationError(`process ${room.processId} is not available.`);
+
+    } else {
+      return sessionIds.map(() => false);
+    }
+  }
+}
+
+/**
+ * Ask a room to dispose itself if it has no connected clients and no
+ * pending seat reservations.
+ *
+ * Best-effort: used by rollback paths to avoid leaving freshly-created,
+ * unused rooms alive until their auto-dispose timeout elapses.
+ */
+export async function disposeRoomIfEmpty(room: IRoomCache): Promise<boolean> {
+  try {
+    return await remoteRoomCall<Room>(
+      room.roomId,
+      '_disposeIfEmptyNow' as keyof Room,
+      [],
+      REMOTE_ROOM_SHORT_TIMEOUT,
+    );
+
+  } catch (e: any) {
+    debugMatchMaking(e);
+    return false;
+  }
+}
+
+/**
+ * Find a public, unlocked room of `roomName` that can still fit
+ * `expectedClients` seats (connected clients + reserved seats vs.
+ * `maxClients`).
+ *
+ * QueueRoom uses this on group dispatch to reuse existing rooms instead
+ * of always creating a new one.
+ */
+export async function findRoomWithCapacity(
+  roomName: string,
+  expectedClients: number,
+): Promise<IRoomCache | undefined> {
+  const rooms = await driver.query({ name: roomName, locked: false, private: false });
+
+  return rooms
+    .filter((room) => (room.maxClients - room.clients) >= expectedClients)
+    // prefer the fullest fitting room, to consolidate partial groups
+    .sort((a, b) => (b.clients / b.maxClients) - (a.clients / a.maxClients))[0];
+}
+
+/**
  * Build a seat reservation object.
  * @param room - The room to build a seat reservation for.
  * @param sessionId - The session ID of the client.
